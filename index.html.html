@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
+<title>실시간 한글 자막</title>
+<script src="https://cdn.jsdelivr.net/npm/microsoft-cognitiveservices-speech-sdk@latest/distrib/browser/microsoft.cognitiveservices.speech.sdk.bundle.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: #0b0b0f;
+    color: #f5f5f5;
+    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  #setup {
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  #setup h1 {
+    font-size: 18px;
+    margin: 0 0 8px 0;
+    color: #f5f5f5;
+  }
+  #setup input, #setup select, #setup button {
+    font-size: 16px;
+    padding: 12px;
+    border-radius: 10px;
+    border: 1px solid #333;
+    background: #1a1a20;
+    color: #f5f5f5;
+  }
+  #setup button {
+    background: #3a7bfd;
+    border: none;
+    font-weight: 600;
+  }
+  #status {
+    font-size: 13px;
+    color: #999;
+    padding: 0 20px;
+  }
+  #caption {
+    display: none;
+    flex: 1;
+    align-items: flex-end;
+    justify-content: center;
+    padding: 24px 16px 32px 16px;
+  }
+  #captionText {
+    font-size: clamp(22px, 6vw, 34px);
+    line-height: 1.4;
+    font-weight: 600;
+    text-align: center;
+    text-shadow: 0 2px 6px rgba(0,0,0,0.8);
+  }
+  .interim { color: #bbb; }
+  .final { color: #fff; }
+  #controls {
+    display: none;
+    padding: 16px;
+    text-align: center;
+  }
+  #stopBtn {
+    font-size: 15px;
+    padding: 10px 20px;
+    border-radius: 20px;
+    border: 1px solid #444;
+    background: #1a1a20;
+    color: #f5f5f5;
+  }
+</style>
+</head>
+<body>
+
+  <div id="setup">
+    <h1>실시간 한글 자막 설정</h1>
+    <input id="key" type="password" placeholder="애저 스피치 구독 키(key)">
+    <input id="region" placeholder="지역(region), 예: koreacentral">
+    <select id="srcLang">
+      <option value="en-US">원본 언어: 영어</option>
+      <option value="ja-JP">원본 언어: 일본어</option>
+    </select>
+    <button id="startBtn">시작</button>
+  </div>
+
+  <div id="status"></div>
+  <div id="caption"><div id="captionText"></div></div>
+  <div id="controls"><button id="stopBtn">중지</button></div>
+
+<script>
+let recognizer;
+
+function setStatus(msg) {
+  document.getElementById('status').textContent = msg;
+}
+
+document.getElementById('startBtn').addEventListener('click', async () => {
+  const key = document.getElementById('key').value.trim();
+  const region = document.getElementById('region').value.trim();
+  const srcLang = document.getElementById('srcLang').value;
+
+  if (!key || !region) {
+    alert('구독 키와 지역을 입력해주세요.');
+    return;
+  }
+
+  if (typeof SpeechSDK === 'undefined') {
+    alert('SDK 로딩에 실패했습니다. 인터넷 연결을 확인해주세요.');
+    return;
+  }
+
+  setStatus('마이크 권한을 요청하는 중...');
+
+  try {
+    const speechConfig = SpeechSDK.SpeechTranslationConfig.fromSubscription(key, region);
+    speechConfig.speechRecognitionLanguage = srcLang;
+    speechConfig.addTargetLanguage('ko');
+
+    const audioConfig = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput();
+    recognizer = new SpeechSDK.TranslationRecognizer(speechConfig, audioConfig);
+
+    const captionText = document.getElementById('captionText');
+
+    recognizer.recognizing = (s, e) => {
+      if (e.result.translations) {
+        const ko = e.result.translations.get('ko');
+        if (ko) {
+          captionText.innerHTML = `<span class="interim">${ko}</span>`;
+        }
+      }
+    };
+
+    recognizer.recognized = (s, e) => {
+      if (e.result.reason === SpeechSDK.ResultReason.TranslatedSpeech) {
+        const ko = e.result.translations.get('ko');
+        if (ko) {
+          captionText.innerHTML = `<span class="final">${ko}</span>`;
+        }
+      }
+    };
+
+    recognizer.canceled = (s, e) => {
+      setStatus('오류: ' + e.errorDetails);
+    };
+
+    recognizer.startContinuousRecognitionAsync(
+      () => {
+        document.getElementById('setup').style.display = 'none';
+        document.getElementById('caption').style.display = 'flex';
+        document.getElementById('controls').style.display = 'block';
+        setStatus('인식 중...');
+      },
+      (err) => {
+        setStatus('시작 실패: ' + err);
+      }
+    );
+  } catch (err) {
+    setStatus('오류 발생: ' + err.message);
+  }
+});
+
+document.getElementById('stopBtn').addEventListener('click', () => {
+  if (recognizer) {
+    recognizer.stopContinuousRecognitionAsync(() => {
+      document.getElementById('setup').style.display = 'flex';
+      document.getElementById('caption').style.display = 'none';
+      document.getElementById('controls').style.display = 'none';
+      setStatus('');
+      recognizer.close();
+      recognizer = null;
+    });
+  }
+});
+</script>
+
+</body>
+</html>
