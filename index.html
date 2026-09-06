@@ -187,13 +187,11 @@ function startPipStream() {
   pipVideo.play().catch(() => {});
   pipStreamStarted = true;
 
-  // iOS에서 캔버스 스트림 프레임이 끊기지 않도록 매 프레임 다시 그려줌
-  const loop = () => {
-    if (!pipStreamStarted) return;
+  // 백그라운드(PIP 전환 등) 상태에서도 계속 그려지도록 setInterval 사용
+  // (requestAnimationFrame은 탭이 백그라운드가 되면 브라우저가 자동으로 멈춤)
+  pipDrawInterval = setInterval(() => {
     drawCaptionToCanvas(lastCaptionText);
-    pipDrawInterval = requestAnimationFrame(loop);
-  };
-  loop();
+  }, 200);
 }
 
 // 저장된 값 불러오기
@@ -258,7 +256,15 @@ document.getElementById('startBtn').addEventListener('click', async () => {
     speechConfig.speechRecognitionLanguage = srcLang;
     speechConfig.addTargetLanguage('ko');
 
-    const audioConfig = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput();
+    // 에코 제거/노이즈 억제를 꺼서 스피커로 재생 중인 영상 소리도 그대로 인식하도록 함
+    const rawStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      }
+    });
+    const audioConfig = SpeechSDK.AudioConfig.fromStreamInput(rawStream);
     recognizer = new SpeechSDK.TranslationRecognizer(speechConfig, audioConfig);
 
     const captionText = document.getElementById('captionText');
@@ -339,7 +345,7 @@ document.getElementById('stopBtn').addEventListener('click', () => {
       }
       pipStreamStarted = false;
       if (pipDrawInterval) {
-        cancelAnimationFrame(pipDrawInterval);
+        clearInterval(pipDrawInterval);
         pipDrawInterval = null;
       }
     });
