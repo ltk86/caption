@@ -82,12 +82,28 @@
   <div id="setup">
     <h1>실시간 한글 자막 설정</h1>
     <input id="key" type="password" placeholder="애저 스피치 구독 키(key)">
-    <input id="region" placeholder="지역(region), 예: koreacentral">
     <select id="srcLang">
       <option value="en-US">원본 언어: 영어</option>
       <option value="ja-JP">원본 언어: 일본어</option>
+      <option value="zh-CN">원본 언어: 중국어(普通话)</option>
+      <option value="es-ES">원본 언어: 스페인어</option>
+      <option value="fr-FR">원본 언어: 프랑스어</option>
+      <option value="de-DE">원본 언어: 독일어</option>
+      <option value="it-IT">원본 언어: 이탈리아어</option>
+      <option value="pt-BR">원본 언어: 포르투갈어(브라질)</option>
+      <option value="ru-RU">원본 언어: 러시아어</option>
+      <option value="vi-VN">원본 언어: 베트남어</option>
+      <option value="th-TH">원본 언어: 태국어</option>
+      <option value="id-ID">원본 언어: 인도네시아어</option>
+      <option value="hi-IN">원본 언어: 힌디어</option>
+      <option value="ar-SA">원본 언어: 아랍어</option>
+      <option value="custom">직접 입력...</option>
     </select>
+    <input id="customLang" placeholder="예: nl-NL (네덜란드어)" style="display:none;">
     <button id="startBtn">시작</button>
+    <label style="font-size:13px;color:#999;display:flex;align-items:center;gap:6px;">
+      <input type="checkbox" id="rememberMe" style="width:auto;padding:0;"> 이 기기에 키 저장하기
+    </label>
   </div>
 
   <div id="status"></div>
@@ -96,19 +112,60 @@
 
 <script>
 let recognizer;
+const FIXED_REGION = 'koreacentral'; // 지역 고정값, 필요시 이 값만 바꾸면 됨
 
 function setStatus(msg) {
   document.getElementById('status').textContent = msg;
 }
 
+// 저장된 값 불러오기
+window.addEventListener('DOMContentLoaded', () => {
+  const saved = localStorage.getItem('captionSettings');
+  if (saved) {
+    try {
+      const s = JSON.parse(saved);
+      document.getElementById('key').value = s.key || '';
+      const langSelect = document.getElementById('srcLang');
+      const isKnown = Array.from(langSelect.options).some(o => o.value === s.srcLang);
+      if (s.srcLang && !isKnown) {
+        langSelect.value = 'custom';
+        document.getElementById('customLang').style.display = 'block';
+        document.getElementById('customLang').value = s.srcLang;
+      } else {
+        langSelect.value = s.srcLang || 'en-US';
+      }
+      document.getElementById('rememberMe').checked = true;
+    } catch (e) {}
+  }
+});
+
+document.getElementById('srcLang').addEventListener('change', (e) => {
+  document.getElementById('customLang').style.display = (e.target.value === 'custom') ? 'block' : 'none';
+});
+
 document.getElementById('startBtn').addEventListener('click', async () => {
   const key = document.getElementById('key').value.trim();
-  const region = document.getElementById('region').value.trim();
-  const srcLang = document.getElementById('srcLang').value;
+  const region = FIXED_REGION;
+  const langSelectValue = document.getElementById('srcLang').value;
+  const srcLang = langSelectValue === 'custom'
+    ? document.getElementById('customLang').value.trim()
+    : langSelectValue;
+  const remember = document.getElementById('rememberMe').checked;
 
-  if (!key || !region) {
-    alert('구독 키와 지역을 입력해주세요.');
+  if (!key) {
+    alert('구독 키를 입력해주세요.');
     return;
+  }
+
+  if (!srcLang) {
+    alert('언어 코드를 입력해주세요. 예: nl-NL');
+    return;
+  }
+
+  if (remember) {
+    localStorage.setItem('captionSettings', JSON.stringify({ key, srcLang }));
+  } else {
+    localStorage.removeItem('captionSettings');
   }
 
   if (typeof SpeechSDK === 'undefined') {
