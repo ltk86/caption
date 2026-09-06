@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
 <title>실시간 한글 자막</title>
 <link rel="apple-touch-icon" href="icon-180.png">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0b0b0f">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="실시간자막">
@@ -120,8 +122,8 @@
     <button id="stopBtn">중지</button>
   </div>
 
-  <canvas id="capCanvas" width="600" height="200" style="display:none;"></canvas>
-  <video id="pipVideo" muted playsinline style="display:none;"></video>
+  <canvas id="capCanvas" width="600" height="200" style="position:fixed;bottom:0;left:0;width:2px;height:2px;opacity:0.01;pointer-events:none;"></canvas>
+  <video id="pipVideo" muted playsinline webkit-playsinline autoplay style="position:fixed;bottom:0;left:4px;width:2px;height:2px;opacity:0.01;pointer-events:none;"></video>
 
 <script>
 let recognizer;
@@ -135,7 +137,7 @@ function setStatus(msg) {
 // 캔버스에 자막 텍스트를 그려서 '가짜 비디오'로 만드는 함수 (PIP용)
 function drawCaptionToCanvas(text) {
   const canvas = document.getElementById('capCanvas');
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext('2d', { alpha: false });
   const w = canvas.width, h = canvas.height;
 
   ctx.clearRect(0, 0, w, h);
@@ -172,6 +174,9 @@ function drawCaptionToCanvas(text) {
 }
 
 // PIP용 비디오 스트림 시작 (캔버스를 실시간 스트리밍)
+let lastCaptionText = '';
+let pipDrawInterval = null;
+
 function startPipStream() {
   if (pipStreamStarted) return;
   const canvas = document.getElementById('capCanvas');
@@ -181,6 +186,14 @@ function startPipStream() {
   pipVideo.srcObject = stream;
   pipVideo.play().catch(() => {});
   pipStreamStarted = true;
+
+  // iOS에서 캔버스 스트림 프레임이 끊기지 않도록 매 프레임 다시 그려줌
+  const loop = () => {
+    if (!pipStreamStarted) return;
+    drawCaptionToCanvas(lastCaptionText);
+    pipDrawInterval = requestAnimationFrame(loop);
+  };
+  loop();
 }
 
 // 저장된 값 불러오기
@@ -255,6 +268,7 @@ document.getElementById('startBtn').addEventListener('click', async () => {
         const ko = e.result.translations.get('ko');
         if (ko) {
           captionText.innerHTML = `<span class="interim">${ko}</span>`;
+          lastCaptionText = ko;
           drawCaptionToCanvas(ko);
         }
       }
@@ -265,6 +279,7 @@ document.getElementById('startBtn').addEventListener('click', async () => {
         const ko = e.result.translations.get('ko');
         if (ko) {
           captionText.innerHTML = `<span class="final">${ko}</span>`;
+          lastCaptionText = ko;
           drawCaptionToCanvas(ko);
         }
       }
@@ -296,9 +311,9 @@ document.getElementById('pipBtn').addEventListener('click', async () => {
   try {
     if (document.pictureInPictureElement) {
       await document.exitPictureInPicture();
-    } else {
-      await pipVideo.requestPictureInPicture();
+      return;
     }
+    await pipVideo.requestPictureInPicture();
   } catch (err) {
     alert('PIP 실행에 실패했어요: ' + err.message + '\n다시 한 번 눌러보시거나, 화면 밝기/저전력 모드를 확인해보세요.');
   }
@@ -323,6 +338,10 @@ document.getElementById('stopBtn').addEventListener('click', () => {
         pipVideo.srcObject = null;
       }
       pipStreamStarted = false;
+      if (pipDrawInterval) {
+        cancelAnimationFrame(pipDrawInterval);
+        pipDrawInterval = null;
+      }
     });
   }
 });
