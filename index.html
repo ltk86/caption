@@ -137,6 +137,14 @@ let rawStream;
 const FIXED_REGION = 'koreacentral'; // 지역 고정값, 필요시 이 값만 바꾸면 됨
 let pipStreamStarted = false;
 
+// 아이폰/아이패드(Safari, WebKit)는 canvas.captureStream() 기반 가짜 영상이 PIP 자격을
+// 인정받지 못하는 경우가 많아, 실제로 디코딩되는 무음 영상 파일 + 네이티브 자막 트랙(WebVTT)
+// 방식을 대신 사용한다. 크롬/안드로이드는 기존에 검증된 캔버스 방식을 그대로 쓴다.
+const pipVideoEl = document.getElementById('pipVideo');
+const isAppleWebKitPip = typeof pipVideoEl.webkitSupportsPresentationMode === 'function';
+let nativeSubtitleTrack = null;
+let nativePipReady = false;
+
 // 재연결 관련 상태
 let isManualStop = true;
 let reconnectAttempts = 0;
@@ -223,23 +231,113 @@ function drawCaptionToCanvas(mainText, prevText) {
   });
 }
 
-// PIP용 비디오 스트림 시작 (캔버스를 실시간 스트리밍)
+// PIP용 비디오 스트림 시작 (캔버스를 실시간 스트리밍) - 크롬/안드로이드용
 let lastCaptionText = '';
 let lastPrevText = '';
 let lastDrawnText = null;
 let lastDrawnPrevText = null;
 let pipDrawInterval = null;
 
-function startPipStream() {
+// --- Safari(WebKit)용: 실제 디코딩되는 무음 영상 + 네이티브 자막 트랙(WebVTT) ---
+// canvas.captureStream()으로 만든 가짜 영상은 iOS에서 PIP 자격을 인정받지 못하는
+// 경우가 많아, 짧은 무음 영상을 실제로 녹화(MediaRecorder)해 파일처럼 재생시키고
+// 자막은 영화 자막과 같은 방식(TextTrack/VTTCue)으로 얹는다.
+async function prepareNativeSubtitlePip() {
+  if (!isAppleWebKitPip || nativePipReady) return;
+
+  const seedCanvas = document.createElement('canvas');
+  seedCanvas.width = 640;
+  seedCanvas.height = 360;
+  const sctx = seedCanvas.getContext('2d');
+  sctx.fillStyle = '#0b0b0f';
+  sctx.fillRect(0, 0, seedCanvas.width, seedCanvas.height);
+
+  const mimeCandidates = [
+    'video/mp4',
+    'video/mp4;codecs=avc1',
+    'video/mp4;codecs=h264',
+    'video/webm;codecs=vp9',
+    'video/webm;codecs=vp8',
+    'video/webm'
+  ];
+  const mimeType = (window.MediaRecorder && mimeCandidates.find(t => MediaRecorder.isTypeSupported(t))) || null;
+  if (!mimeType) {
+    setStatus('이 기기에서는 PIP용 영상을 만들 수 없습니다(MediaRecorder 미지원).');
+    return;
+  }
+
+  const seedStream = seedCanvas.captureStream(2);
+  const chunks = [];
+  const recorder = new MediaRecorder(seedStream, { mimeType });
+  recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+
+  await new Promise((resolve) => {
+    recorder.onstop = resolve;
+    recorder.start();
+    setTimeout(() => recorder.stop(), 2000);
+  });
+  seedStream.getTracks().forEach(t => t.stop());
+
+  const blob = new Blob(chunks, { type: mimeType });
+  const url = URL.createObjectURL(blob);
+
+  pipVideoEl.muted = true;
+  pipVideoEl.loop = true;
+  pipVideoEl.src = url;
+
+  await new Promise((resolve) => {
+    pipVideoEl.onloadedmetadata = resolve;
+    pipVideoEl.load();
+  });
+
+  nativeSubtitleTrack = pipVideoEl.addTextTrack('subtitles', '자막', 'ko');
+  nativeSubtitleTrack.mode = 'showing';
+
+  pipVideoEl.play().catch(() => {});
+  nativePipReady = true;
+}
+
+// 자막 텍스트가 바뀔 때마다 기존 큐를 지우고 새 큐로 교체 (즉시 다시 렌더링되도록)
+function updateNativeSubtitleCue(mainText, prevText) {
+  if (!nativeSubtitleTrack) return;
+
+  Array.from(nativeSubtitleTrack.cues || []).forEach(c => nativeSubtitleTrack.removeCue(c));
+
+  const combined = [prevText, mainText].filter(Boolean).join('\n');
+  if (!combined) return;
+
+  const end = (pipVideoEl.duration && isFinite(pipVideoEl.duration)) ? pipVideoEl.duration : 86400;
+  try {
+    nativeSubtitleTrack.addCue(new VTTCue(0, end, combined));
+  } catch (e) {}
+}
+
+function resetNativeSubtitlePip() {
+  if (pipVideoEl.src) {
+    URL.revokeObjectURL(pipVideoEl.src);
+    pipVideoEl.removeAttribute('src');
+    pipVideoEl.load();
+  }
+  nativeSubtitleTrack = null;
+  nativePipReady = false;
+}
+
+async function startPipStream() {
   if (pipStreamStarted) return;
+
+  if (isAppleWebKitPip) {
+    await prepareNativeSubtitlePip();
+    pipStreamStarted = true;
+    return;
+  }
+
   const canvas = document.getElementById('capCanvas');
-  const pipVideo = document.getElementById('pipVideo');
   drawCaptionToCanvas('', ''); // 초기 프레임
   lastDrawnText = '';
   lastDrawnPrevText = '';
   const stream = canvas.captureStream(15);
-  pipVideo.srcObject = stream;
-  pipVideo.play().catch(() => {});
+  pipVideoEl.srcObject = stream;
+  pipVideoEl.play().catch(() => {});
   pipStreamStarted = true;
 
   // 백그라운드(PIP 전환 등) 상태에서도 계속 그려지도록 setInterval 사용
@@ -301,9 +399,13 @@ function updateCaptionUI(text, isFinal) {
   curLine.textContent = text;
   curLine.className = isFinal ? 'final' : 'interim';
 
-  lastCaptionText = text;
-  lastPrevText = prevDisplayText;
-  drawCaptionToCanvas(text, prevDisplayText);
+  if (isAppleWebKitPip) {
+    updateNativeSubtitleCue(text, prevDisplayText);
+  } else {
+    lastCaptionText = text;
+    lastPrevText = prevDisplayText;
+    drawCaptionToCanvas(text, prevDisplayText);
+  }
 }
 
 function stopMicStream() {
@@ -441,20 +543,23 @@ document.getElementById('startBtn').addEventListener('click', async () => {
 
 // iOS Safari는 표준 Picture-in-Picture API 대신 webkit 전용 API를 쓰는 경우가 있어 둘 다 지원
 document.getElementById('pipBtn').addEventListener('click', async () => {
-  const pipVideo = document.getElementById('pipVideo');
+  if (isAppleWebKitPip) {
+    // 녹화가 아직 안 끝났으면 여기서 마무리될 때까지 기다림 (보통 시작 버튼을 누른 시점에 이미 준비됨)
+    await prepareNativeSubtitlePip();
+  }
 
-  const usesWebkitApi = typeof pipVideo.webkitSupportsPresentationMode === 'function'
-    && pipVideo.webkitSupportsPresentationMode('picture-in-picture');
+  const usesWebkitApi = typeof pipVideoEl.webkitSupportsPresentationMode === 'function'
+    && pipVideoEl.webkitSupportsPresentationMode('picture-in-picture');
 
   try {
     // 비디오가 실제로 재생 준비(readyState)되지 않으면 iOS에서 PIP 요청이 조용히 무시되는 경우가 있음
-    if (pipVideo.readyState < 2) {
-      await pipVideo.play().catch(() => {});
+    if (pipVideoEl.readyState < 2) {
+      await pipVideoEl.play().catch(() => {});
     }
 
     if (usesWebkitApi) {
-      const inPip = pipVideo.webkitPresentationMode === 'picture-in-picture';
-      pipVideo.webkitSetPresentationMode(inPip ? 'inline' : 'picture-in-picture');
+      const inPip = pipVideoEl.webkitPresentationMode === 'picture-in-picture';
+      pipVideoEl.webkitSetPresentationMode(inPip ? 'inline' : 'picture-in-picture');
       return;
     }
 
@@ -467,9 +572,9 @@ document.getElementById('pipBtn').addEventListener('click', async () => {
       await document.exitPictureInPicture();
       return;
     }
-    await pipVideo.requestPictureInPicture();
+    await pipVideoEl.requestPictureInPicture();
   } catch (err) {
-    alert('PIP 실행에 실패했어요: ' + err.message + '\n다시 한 번 눌러보시거나, 화면 밝기/저전력 모드를 확인해보세요.\n(iOS는 기기·버전에 따라 캔버스 기반 영상의 PIP를 지원하지 않을 수 있습니다)');
+    alert('PIP 실행에 실패했어요: ' + err.message + '\n다시 한 번 눌러보시거나, 화면 밝기/저전력 모드를 확인해보세요.');
   }
 });
 
@@ -491,13 +596,18 @@ document.getElementById('stopBtn').addEventListener('click', () => {
     lastPrevText = '';
     stopMicStream();
 
-    const pipVideo = document.getElementById('pipVideo');
     if (document.pictureInPictureElement) {
       document.exitPictureInPicture().catch(() => {});
     }
-    if (pipVideo.srcObject) {
-      pipVideo.srcObject.getTracks().forEach(t => t.stop());
-      pipVideo.srcObject = null;
+    if (isAppleWebKitPip && pipVideoEl.webkitPresentationMode === 'picture-in-picture') {
+      pipVideoEl.webkitSetPresentationMode('inline');
+    }
+
+    if (isAppleWebKitPip) {
+      resetNativeSubtitlePip();
+    } else if (pipVideoEl.srcObject) {
+      pipVideoEl.srcObject.getTracks().forEach(t => t.stop());
+      pipVideoEl.srcObject = null;
     }
     pipStreamStarted = false;
     if (pipDrawInterval) {
