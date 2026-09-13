@@ -128,7 +128,7 @@
     <button id="stopBtn">중지</button>
   </div>
 
-  <canvas id="capCanvas" width="800" height="260" style="position:fixed;bottom:0;left:0;width:2px;height:2px;opacity:0.01;pointer-events:none;"></canvas>
+  <canvas id="capCanvas" width="800" height="320" style="position:fixed;bottom:0;left:0;width:2px;height:2px;opacity:0.01;pointer-events:none;"></canvas>
   <video id="pipVideo" muted playsinline webkit-playsinline autoplay style="position:fixed;bottom:0;left:4px;width:2px;height:2px;opacity:0.01;pointer-events:none;"></video>
 
 <script>
@@ -147,31 +147,16 @@ let currentSrcLang = '';
 
 // 자막 두 줄(직전 문장 + 현재 문장) 표시용 상태
 // finalText: curLine에 마지막으로 표시했던 텍스트(interim이든 final이든)
+// prevDisplayText: prevLine(흐린 이전 줄)에 표시 중인 텍스트
 let finalText = '';
+let prevDisplayText = '';
 
 function setStatus(msg) {
   document.getElementById('status').textContent = msg;
 }
 
-// 캔버스에 자막 텍스트를 그려서 '가짜 비디오'로 만드는 함수 (PIP용)
-function drawCaptionToCanvas(text) {
-  const canvas = document.getElementById('capCanvas');
-  const ctx = canvas.getContext('2d', { alpha: false });
-  const w = canvas.width, h = canvas.height;
-
-  ctx.clearRect(0, 0, w, h);
-  ctx.fillStyle = '#0b0b0f';
-  ctx.fillRect(0, 0, w, h);
-
-  // 캔버스 높이에 비례한 폰트 크기 (기기/해상도에 따라 고정 크기가 어색해지는 것을 방지)
-  const fontSize = Math.round(h * 0.16);
-  ctx.fillStyle = '#ffffff';
-  ctx.font = `bold ${fontSize}px -apple-system, sans-serif`;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-
-  // 간단한 줄바꿈 처리
-  const maxWidth = w - 40;
+// 텍스트를 캔버스 폭에 맞게 줄바꿈 (ctx.font가 미리 설정되어 있어야 함)
+function wrapTextLines(ctx, text, maxWidth, maxLines) {
   const words = (text || '').split(' ');
   let lines = [];
   let line = '';
@@ -185,26 +170,73 @@ function drawCaptionToCanvas(text) {
     }
   }
   if (line) lines.push(line);
-  lines = lines.slice(-3); // 최대 3줄만 표시
+  return lines.slice(-maxLines);
+}
 
-  const lineHeight = Math.round(fontSize * 1.25);
-  const startY = h / 2 - ((lines.length - 1) * lineHeight) / 2;
-  lines.forEach((l, i) => {
-    ctx.fillText(l, w / 2, startY + i * lineHeight);
+// 캔버스에 자막 텍스트를 그려서 '가짜 비디오'로 만드는 함수 (PIP용)
+// 앱 화면과 동일하게 이전 줄(흐리게, 작게)과 현재 줄(밝게, 크게)을 함께 그린다.
+function drawCaptionToCanvas(mainText, prevText) {
+  const canvas = document.getElementById('capCanvas');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  const w = canvas.width, h = canvas.height;
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = '#0b0b0f';
+  ctx.fillRect(0, 0, w, h);
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  const maxWidth = w - 40;
+
+  // 캔버스 높이에 비례한 폰트 크기 (기기/해상도에 따라 고정 크기가 어색해지는 것을 방지)
+  const mainFontSize = Math.round(h * 0.15);
+  const prevFontSize = Math.round(mainFontSize * 0.7);
+  const mainLineHeight = Math.round(mainFontSize * 1.25);
+  const prevLineHeight = Math.round(prevFontSize * 1.25);
+
+  ctx.font = `${prevFontSize}px -apple-system, sans-serif`;
+  const prevLines = prevText ? wrapTextLines(ctx, prevText, maxWidth, 1) : [];
+
+  ctx.font = `bold ${mainFontSize}px -apple-system, sans-serif`;
+  const mainLines = wrapTextLines(ctx, mainText, maxWidth, 2);
+
+  const gap = prevLines.length ? Math.round(mainFontSize * 0.3) : 0;
+  const totalHeight = prevLines.length * prevLineHeight + gap + mainLines.length * mainLineHeight;
+  let y = h / 2 - totalHeight / 2;
+
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.font = `${prevFontSize}px -apple-system, sans-serif`;
+  prevLines.forEach((l) => {
+    y += prevLineHeight / 2;
+    ctx.fillText(l, w / 2, y);
+    y += prevLineHeight / 2;
+  });
+
+  y += gap;
+
+  ctx.fillStyle = '#ffffff';
+  ctx.font = `bold ${mainFontSize}px -apple-system, sans-serif`;
+  mainLines.forEach((l) => {
+    y += mainLineHeight / 2;
+    ctx.fillText(l, w / 2, y);
+    y += mainLineHeight / 2;
   });
 }
 
 // PIP용 비디오 스트림 시작 (캔버스를 실시간 스트리밍)
 let lastCaptionText = '';
+let lastPrevText = '';
 let lastDrawnText = null;
+let lastDrawnPrevText = null;
 let pipDrawInterval = null;
 
 function startPipStream() {
   if (pipStreamStarted) return;
   const canvas = document.getElementById('capCanvas');
   const pipVideo = document.getElementById('pipVideo');
-  drawCaptionToCanvas(''); // 초기 프레임
+  drawCaptionToCanvas('', ''); // 초기 프레임
   lastDrawnText = '';
+  lastDrawnPrevText = '';
   const stream = canvas.captureStream(15);
   pipVideo.srcObject = stream;
   pipVideo.play().catch(() => {});
@@ -214,9 +246,10 @@ function startPipStream() {
   // (requestAnimationFrame은 탭이 백그라운드가 되면 브라우저가 자동으로 멈춤)
   // 텍스트가 바뀌지 않았으면 다시 그리지 않아 배터리 소모를 줄인다.
   pipDrawInterval = setInterval(() => {
-    if (lastCaptionText === lastDrawnText) return;
+    if (lastCaptionText === lastDrawnText && lastPrevText === lastDrawnPrevText) return;
     lastDrawnText = lastCaptionText;
-    drawCaptionToCanvas(lastCaptionText);
+    lastDrawnPrevText = lastPrevText;
+    drawCaptionToCanvas(lastCaptionText, lastPrevText);
   }, 200);
 }
 
@@ -260,7 +293,8 @@ function updateCaptionUI(text, isFinal) {
 
   const isNewPhrase = finalText && text.length < finalText.length * 0.6;
   if (isNewPhrase) {
-    prevLine.textContent = finalText;
+    prevDisplayText = finalText;
+    prevLine.textContent = prevDisplayText;
   }
 
   finalText = text;
@@ -268,7 +302,8 @@ function updateCaptionUI(text, isFinal) {
   curLine.className = isFinal ? 'final' : 'interim';
 
   lastCaptionText = text;
-  drawCaptionToCanvas(text);
+  lastPrevText = prevDisplayText;
+  drawCaptionToCanvas(text, prevDisplayText);
 }
 
 function stopMicStream() {
@@ -398,6 +433,7 @@ document.getElementById('startBtn').addEventListener('click', async () => {
   isManualStop = false;
   reconnectAttempts = 0;
   finalText = '';
+  prevDisplayText = '';
 
   setStatus('마이크 권한을 요청하는 중...');
   await startRecognition();
@@ -450,6 +486,9 @@ document.getElementById('stopBtn').addEventListener('click', () => {
     document.getElementById('prevLine').textContent = '';
     document.getElementById('curLine').textContent = '';
     finalText = '';
+    prevDisplayText = '';
+    lastCaptionText = '';
+    lastPrevText = '';
     stopMicStream();
 
     const pipVideo = document.getElementById('pipVideo');
