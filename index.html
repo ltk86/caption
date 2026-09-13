@@ -10,7 +10,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="실시간자막">
-<script src="https://cdn.jsdelivr.net/npm/microsoft-cognitiveservices-speech-sdk@latest/distrib/browser/microsoft.cognitiveservices.speech.sdk.bundle-min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/microsoft-cognitiveservices-speech-sdk@1.51.0/distrib/browser/microsoft.cognitiveservices.speech.sdk.bundle-min.js"></script>
 <style>
   * { box-sizing: border-box; }
   body {
@@ -66,6 +66,10 @@
     text-align: center;
     text-shadow: 0 2px 6px rgba(0,0,0,0.8);
   }
+  #prevLine {
+    opacity: 0.5;
+    font-size: 0.8em;
+  }
   .interim { color: #bbb; }
   .final { color: #fff; }
   #controls {
@@ -116,19 +120,31 @@
   </div>
 
   <div id="status"></div>
-  <div id="caption"><div id="captionText"></div></div>
+  <div id="caption"><div id="captionText"><div id="prevLine" class="final"></div><div id="curLine"></div></div></div>
   <div id="controls">
     <button id="pipBtn">PIP로 띄우기</button>
     <button id="stopBtn">중지</button>
   </div>
 
-  <canvas id="capCanvas" width="600" height="200" style="position:fixed;bottom:0;left:0;width:2px;height:2px;opacity:0.01;pointer-events:none;"></canvas>
+  <canvas id="capCanvas" width="800" height="260" style="position:fixed;bottom:0;left:0;width:2px;height:2px;opacity:0.01;pointer-events:none;"></canvas>
   <video id="pipVideo" muted playsinline webkit-playsinline autoplay style="position:fixed;bottom:0;left:4px;width:2px;height:2px;opacity:0.01;pointer-events:none;"></video>
 
 <script>
 let recognizer;
+let rawStream;
 const FIXED_REGION = 'koreacentral'; // 지역 고정값, 필요시 이 값만 바꾸면 됨
 let pipStreamStarted = false;
+
+// 재연결 관련 상태
+let isManualStop = true;
+let reconnectAttempts = 0;
+let reconnectTimer = null;
+const MAX_RECONNECT_ATTEMPTS = 5;
+let currentKey = '';
+let currentSrcLang = '';
+
+// 자막 두 줄(직전 문장 + 현재 문장) 표시용 상태
+let finalText = '';
 
 function setStatus(msg) {
   document.getElementById('status').textContent = msg;
@@ -144,8 +160,10 @@ function drawCaptionToCanvas(text) {
   ctx.fillStyle = '#0b0b0f';
   ctx.fillRect(0, 0, w, h);
 
+  // 캔버스 높이에 비례한 폰트 크기 (기기/해상도에 따라 고정 크기가 어색해지는 것을 방지)
+  const fontSize = Math.round(h * 0.16);
   ctx.fillStyle = '#ffffff';
-  ctx.font = 'bold 32px -apple-system, sans-serif';
+  ctx.font = `bold ${fontSize}px -apple-system, sans-serif`;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
 
@@ -166,7 +184,7 @@ function drawCaptionToCanvas(text) {
   if (line) lines.push(line);
   lines = lines.slice(-3); // 최대 3줄만 표시
 
-  const lineHeight = 40;
+  const lineHeight = Math.round(fontSize * 1.25);
   const startY = h / 2 - ((lines.length - 1) * lineHeight) / 2;
   lines.forEach((l, i) => {
     ctx.fillText(l, w / 2, startY + i * lineHeight);
@@ -175,6 +193,7 @@ function drawCaptionToCanvas(text) {
 
 // PIP용 비디오 스트림 시작 (캔버스를 실시간 스트리밍)
 let lastCaptionText = '';
+let lastDrawnText = null;
 let pipDrawInterval = null;
 
 function startPipStream() {
@@ -182,6 +201,7 @@ function startPipStream() {
   const canvas = document.getElementById('capCanvas');
   const pipVideo = document.getElementById('pipVideo');
   drawCaptionToCanvas(''); // 초기 프레임
+  lastDrawnText = '';
   const stream = canvas.captureStream(15);
   pipVideo.srcObject = stream;
   pipVideo.play().catch(() => {});
@@ -189,7 +209,10 @@ function startPipStream() {
 
   // 백그라운드(PIP 전환 등) 상태에서도 계속 그려지도록 setInterval 사용
   // (requestAnimationFrame은 탭이 백그라운드가 되면 브라우저가 자동으로 멈춤)
+  // 텍스트가 바뀌지 않았으면 다시 그리지 않아 배터리 소모를 줄인다.
   pipDrawInterval = setInterval(() => {
+    if (lastCaptionText === lastDrawnText) return;
+    lastDrawnText = lastCaptionText;
     drawCaptionToCanvas(lastCaptionText);
   }, 200);
 }
@@ -219,9 +242,121 @@ document.getElementById('srcLang').addEventListener('change', (e) => {
   document.getElementById('customLang').style.display = (e.target.value === 'custom') ? 'block' : 'none';
 });
 
+// 언어 코드 형식 검증 (예: en-US, nl-NL)
+function isValidLangCode(code) {
+  return /^[a-zA-Z]{2,3}-[a-zA-Z]{2,4}$/.test(code);
+}
+
+// 자막 두 줄(직전 완료 문장 + 현재 문장) 갱신
+function updateCaptionUI(text, isFinal) {
+  const prevLine = document.getElementById('prevLine');
+  const curLine = document.getElementById('curLine');
+
+  if (isFinal) {
+    prevLine.textContent = finalText;
+    finalText = text;
+    curLine.textContent = text;
+    curLine.className = 'final';
+  } else {
+    prevLine.textContent = finalText;
+    curLine.textContent = text;
+    curLine.className = 'interim';
+  }
+
+  lastCaptionText = text;
+  drawCaptionToCanvas(text);
+}
+
+function stopMicStream() {
+  if (rawStream) {
+    rawStream.getTracks().forEach(t => t.stop());
+    rawStream = null;
+  }
+}
+
+function scheduleReconnect(reason) {
+  if (isManualStop) return;
+
+  reconnectAttempts++;
+  if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+    setStatus('연결이 끊어졌습니다(' + reason + '). 중지 후 다시 시작해주세요.');
+    return;
+  }
+
+  const delayMs = Math.min(1000 * (2 ** (reconnectAttempts - 1)), 16000);
+  setStatus(`연결이 끊어졌습니다. ${Math.round(delayMs / 1000)}초 후 재연결 시도... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    startRecognition();
+  }, delayMs);
+}
+
+async function startRecognition() {
+  if (recognizer) {
+    try { recognizer.close(); } catch (e) {}
+    recognizer = null;
+  }
+  stopMicStream();
+
+  try {
+    const speechConfig = SpeechSDK.SpeechTranslationConfig.fromSubscription(currentKey, FIXED_REGION);
+    speechConfig.speechRecognitionLanguage = currentSrcLang;
+    speechConfig.addTargetLanguage('ko');
+
+    // 에코 제거/노이즈 억제를 꺼서 스피커로 재생 중인 영상 소리도 그대로 인식하도록 함
+    rawStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      }
+    });
+    const audioConfig = SpeechSDK.AudioConfig.fromStreamInput(rawStream);
+    recognizer = new SpeechSDK.TranslationRecognizer(speechConfig, audioConfig);
+
+    recognizer.recognizing = (s, e) => {
+      if (e.result.translations) {
+        const ko = e.result.translations.get('ko');
+        if (ko) updateCaptionUI(ko, false);
+      }
+    };
+
+    recognizer.recognized = (s, e) => {
+      if (e.result.reason === SpeechSDK.ResultReason.TranslatedSpeech) {
+        const ko = e.result.translations.get('ko');
+        if (ko) updateCaptionUI(ko, true);
+      }
+    };
+
+    recognizer.canceled = (s, e) => {
+      scheduleReconnect(e.errorDetails || '알 수 없는 오류');
+    };
+
+    recognizer.sessionStopped = () => {
+      scheduleReconnect('세션 종료');
+    };
+
+    recognizer.startContinuousRecognitionAsync(
+      () => {
+        reconnectAttempts = 0;
+        document.getElementById('setup').style.display = 'none';
+        document.getElementById('caption').style.display = 'flex';
+        document.getElementById('controls').style.display = 'flex';
+        setStatus('인식 중...');
+        startPipStream();
+      },
+      (err) => {
+        setStatus('시작 실패: ' + err);
+      }
+    );
+  } catch (err) {
+    setStatus('오류 발생: ' + err.message);
+  }
+}
+
 document.getElementById('startBtn').addEventListener('click', async () => {
   const key = document.getElementById('key').value.trim();
-  const region = FIXED_REGION;
   const langSelectValue = document.getElementById('srcLang').value;
   const srcLang = langSelectValue === 'custom'
     ? document.getElementById('customLang').value.trim()
@@ -238,10 +373,9 @@ document.getElementById('startBtn').addEventListener('click', async () => {
     return;
   }
 
-  if (remember) {
-    localStorage.setItem('captionSettings', JSON.stringify({ key, srcLang }));
-  } else {
-    localStorage.removeItem('captionSettings');
+  if (!isValidLangCode(srcLang)) {
+    alert('언어 코드 형식이 올바르지 않습니다. 예: en-US, nl-NL');
+    return;
   }
 
   if (typeof SpeechSDK === 'undefined') {
@@ -249,67 +383,20 @@ document.getElementById('startBtn').addEventListener('click', async () => {
     return;
   }
 
-  setStatus('마이크 권한을 요청하는 중...');
-
-  try {
-    const speechConfig = SpeechSDK.SpeechTranslationConfig.fromSubscription(key, region);
-    speechConfig.speechRecognitionLanguage = srcLang;
-    speechConfig.addTargetLanguage('ko');
-
-    // 에코 제거/노이즈 억제를 꺼서 스피커로 재생 중인 영상 소리도 그대로 인식하도록 함
-    const rawStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false
-      }
-    });
-    const audioConfig = SpeechSDK.AudioConfig.fromStreamInput(rawStream);
-    recognizer = new SpeechSDK.TranslationRecognizer(speechConfig, audioConfig);
-
-    const captionText = document.getElementById('captionText');
-
-    recognizer.recognizing = (s, e) => {
-      if (e.result.translations) {
-        const ko = e.result.translations.get('ko');
-        if (ko) {
-          captionText.innerHTML = `<span class="interim">${ko}</span>`;
-          lastCaptionText = ko;
-          drawCaptionToCanvas(ko);
-        }
-      }
-    };
-
-    recognizer.recognized = (s, e) => {
-      if (e.result.reason === SpeechSDK.ResultReason.TranslatedSpeech) {
-        const ko = e.result.translations.get('ko');
-        if (ko) {
-          captionText.innerHTML = `<span class="final">${ko}</span>`;
-          lastCaptionText = ko;
-          drawCaptionToCanvas(ko);
-        }
-      }
-    };
-
-    recognizer.canceled = (s, e) => {
-      setStatus('오류: ' + e.errorDetails);
-    };
-
-    recognizer.startContinuousRecognitionAsync(
-      () => {
-        document.getElementById('setup').style.display = 'none';
-        document.getElementById('caption').style.display = 'flex';
-        document.getElementById('controls').style.display = 'flex';
-        setStatus('인식 중...');
-        startPipStream();
-      },
-      (err) => {
-        setStatus('시작 실패: ' + err);
-      }
-    );
-  } catch (err) {
-    setStatus('오류 발생: ' + err.message);
+  if (remember) {
+    localStorage.setItem('captionSettings', JSON.stringify({ key, srcLang }));
+  } else {
+    localStorage.removeItem('captionSettings');
   }
+
+  currentKey = key;
+  currentSrcLang = srcLang;
+  isManualStop = false;
+  reconnectAttempts = 0;
+  finalText = '';
+
+  setStatus('마이크 권한을 요청하는 중...');
+  await startRecognition();
 });
 
 document.getElementById('pipBtn').addEventListener('click', async () => {
@@ -326,29 +413,46 @@ document.getElementById('pipBtn').addEventListener('click', async () => {
 });
 
 document.getElementById('stopBtn').addEventListener('click', () => {
+  isManualStop = true;
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+
+  const finishStop = () => {
+    document.getElementById('setup').style.display = 'flex';
+    document.getElementById('caption').style.display = 'none';
+    document.getElementById('controls').style.display = 'none';
+    setStatus('');
+    document.getElementById('prevLine').textContent = '';
+    document.getElementById('curLine').textContent = '';
+    finalText = '';
+    stopMicStream();
+
+    const pipVideo = document.getElementById('pipVideo');
+    if (document.pictureInPictureElement) {
+      document.exitPictureInPicture().catch(() => {});
+    }
+    if (pipVideo.srcObject) {
+      pipVideo.srcObject.getTracks().forEach(t => t.stop());
+      pipVideo.srcObject = null;
+    }
+    pipStreamStarted = false;
+    if (pipDrawInterval) {
+      clearInterval(pipDrawInterval);
+      pipDrawInterval = null;
+    }
+  };
+
   if (recognizer) {
     recognizer.stopContinuousRecognitionAsync(() => {
-      document.getElementById('setup').style.display = 'flex';
-      document.getElementById('caption').style.display = 'none';
-      document.getElementById('controls').style.display = 'none';
-      setStatus('');
       recognizer.close();
       recognizer = null;
-
-      const pipVideo = document.getElementById('pipVideo');
-      if (document.pictureInPictureElement) {
-        document.exitPictureInPicture().catch(() => {});
-      }
-      if (pipVideo.srcObject) {
-        pipVideo.srcObject.getTracks().forEach(t => t.stop());
-        pipVideo.srcObject = null;
-      }
-      pipStreamStarted = false;
-      if (pipDrawInterval) {
-        clearInterval(pipDrawInterval);
-        pipDrawInterval = null;
-      }
+      finishStop();
+    }, () => {
+      recognizer = null;
+      finishStop();
     });
+  } else {
+    finishStop();
   }
 });
 </script>
