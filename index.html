@@ -115,6 +115,10 @@
       <option value="custom">직접 입력...</option>
     </select>
     <input id="customLang" placeholder="예: nl-NL (네덜란드어)" style="display:none;">
+    <select id="audioSource">
+      <option value="mic">오디오 입력: 마이크(스피커 소리를 다시 듣기)</option>
+      <option value="display">오디오 입력: 화면/탭 오디오 공유(크롬 전용, 더 깨끗함)</option>
+    </select>
     <button id="startBtn">시작</button>
     <label style="font-size:13px;color:#999;display:flex;align-items:center;gap:6px;">
       <input type="checkbox" id="rememberMe" style="width:auto;padding:0;"> 이 기기에 키 저장하기
@@ -152,6 +156,7 @@ let reconnectTimer = null;
 const MAX_RECONNECT_ATTEMPTS = 5;
 let currentKey = '';
 let currentSrcLang = '';
+let currentAudioSource = 'mic';
 
 // 자막 두 줄(직전 문장 + 현재 문장) 표시용 상태
 // finalText: curLine에 마지막으로 표시했던 텍스트(interim이든 final이든)
@@ -367,6 +372,7 @@ window.addEventListener('DOMContentLoaded', () => {
       } else {
         langSelect.value = s.srcLang || 'en-US';
       }
+      document.getElementById('audioSource').value = s.audioSource || 'mic';
       document.getElementById('rememberMe').checked = true;
     } catch (e) {}
   }
@@ -415,6 +421,38 @@ function stopMicStream() {
   }
 }
 
+// 오디오 입력을 가져온다.
+// - 'mic': 기존 방식. 스피커로 재생 중인 소리를 마이크가 다시 주워듣기 때문에
+//   방 잡음/울림이 그대로 인식 품질에 영향을 준다.
+// - 'display': 화면/탭 공유로 오디오를 디지털로 직접 캡처(크롬 전용). 마이크를
+//   거치지 않아 훨씬 깨끗한 소스를 넘길 수 있다. 공유 대상으로 "크롬 탭"을 고르고
+//   "탭 오디오 공유"를 체크해야 오디오 트랙이 들어온다.
+async function acquireAudioStream() {
+  if (currentAudioSource === 'display') {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      throw new Error('이 브라우저는 화면/탭 오디오 공유를 지원하지 않습니다. 크롬을 사용해주세요.');
+    }
+    const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+    const audioTracks = displayStream.getAudioTracks();
+    if (audioTracks.length === 0) {
+      displayStream.getTracks().forEach(t => t.stop());
+      throw new Error('공유한 화면/탭에 오디오가 없습니다. 공유 창에서 "탭 오디오 공유"를 체크했는지 확인해주세요.');
+    }
+    // 화면 미리보기는 필요 없으니 비디오 트랙은 바로 정리
+    displayStream.getVideoTracks().forEach(t => t.stop());
+    return displayStream;
+  }
+
+  // 에코 제거/노이즈 억제를 꺼서 스피커로 재생 중인 영상 소리도 그대로 인식하도록 함
+  return navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false
+    }
+  });
+}
+
 function scheduleReconnect(reason) {
   if (isManualStop) return;
 
@@ -445,14 +483,7 @@ async function startRecognition() {
     speechConfig.speechRecognitionLanguage = currentSrcLang;
     speechConfig.addTargetLanguage('ko');
 
-    // 에코 제거/노이즈 억제를 꺼서 스피커로 재생 중인 영상 소리도 그대로 인식하도록 함
-    rawStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false
-      }
-    });
+    rawStream = await acquireAudioStream();
     const audioConfig = SpeechSDK.AudioConfig.fromStreamInput(rawStream);
     recognizer = new SpeechSDK.TranslationRecognizer(speechConfig, audioConfig);
 
@@ -502,6 +533,7 @@ document.getElementById('startBtn').addEventListener('click', async () => {
   const srcLang = langSelectValue === 'custom'
     ? document.getElementById('customLang').value.trim()
     : langSelectValue;
+  const audioSource = document.getElementById('audioSource').value;
   const remember = document.getElementById('rememberMe').checked;
 
   if (!key) {
@@ -525,19 +557,20 @@ document.getElementById('startBtn').addEventListener('click', async () => {
   }
 
   if (remember) {
-    localStorage.setItem('captionSettings', JSON.stringify({ key, srcLang }));
+    localStorage.setItem('captionSettings', JSON.stringify({ key, srcLang, audioSource }));
   } else {
     localStorage.removeItem('captionSettings');
   }
 
   currentKey = key;
   currentSrcLang = srcLang;
+  currentAudioSource = audioSource;
   isManualStop = false;
   reconnectAttempts = 0;
   finalText = '';
   prevDisplayText = '';
 
-  setStatus('마이크 권한을 요청하는 중...');
+  setStatus(audioSource === 'display' ? '공유할 화면/탭을 선택해주세요...' : '마이크 권한을 요청하는 중...');
   await startRecognition();
 });
 
