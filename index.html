@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
 <title>실시간 한글 자막</title>
+<link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-180.png">
 <link rel="manifest" href="manifest.json?v=2">
 <meta name="theme-color" content="#0b0b0f">
@@ -47,11 +48,27 @@
     border: none;
     font-weight: 600;
   }
+  #setup button:disabled, #controls button:disabled {
+    opacity: 0.5;
+  }
+  #clearKeyBtn {
+    background: none;
+    border: none;
+    color: #777;
+    font-size: 12px;
+    text-decoration: underline;
+    padding: 4px 0;
+    width: auto;
+    cursor: pointer;
+  }
   #status {
     font-size: 13px;
     color: #999;
     padding: 0 20px;
   }
+  #status.status-ok { color: #4ade80; }
+  #status.status-warn { color: #fbbf24; }
+  #status.status-error { color: #ff6b6b; }
   #caption {
     display: none;
     flex: 1;
@@ -123,6 +140,7 @@
     <label style="font-size:13px;color:#999;display:flex;align-items:center;gap:6px;">
       <input type="checkbox" id="rememberMe" style="width:auto;padding:0;"> 이 기기에 키 저장하기
     </label>
+    <button type="button" id="clearKeyBtn">저장된 키 삭제</button>
   </div>
 
   <div id="status"></div>
@@ -153,10 +171,35 @@ let nativePipReady = false;
 let isManualStop = true;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
+let awaitingNetwork = false; // 오프라인이라 재시도를 보류 중인지
 const MAX_RECONNECT_ATTEMPTS = 5;
 let currentKey = '';
 let currentSrcLang = '';
 let currentAudioSource = 'mic';
+
+// 화면 꺼짐 방지(Wake Lock) - 자막을 보는 동안 화면이 자동으로 꺼지면
+// 인식 자체는 계속되지만 자막을 볼 수 없게 되므로 인식 중에는 꺼짐을 막는다.
+let wakeLock = null;
+async function requestWakeLock() {
+  try {
+    if ('wakeLock' in navigator) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    }
+  } catch (e) {}
+}
+function releaseWakeLock() {
+  if (wakeLock) {
+    wakeLock.release().catch(() => {});
+    wakeLock = null;
+  }
+}
+// 브라우저가 탭 전환 시 Wake Lock을 자동 해제하는 경우가 있어, 다시 돌아오면 재요청
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && !isManualStop && recognizer && !wakeLock) {
+    requestWakeLock();
+  }
+});
 
 // 자막 두 줄(직전 문장 + 현재 문장) 표시용 상태
 // finalText: curLine에 마지막으로 표시했던 텍스트(interim이든 final이든)
@@ -164,8 +207,10 @@ let currentAudioSource = 'mic';
 let finalText = '';
 let prevDisplayText = '';
 
-function setStatus(msg) {
-  document.getElementById('status').textContent = msg;
+function setStatus(msg, type) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = type ? 'status-' + type : '';
 }
 
 // 텍스트를 캔버스 폭에 맞게 줄바꿈 (ctx.font가 미리 설정되어 있어야 함)
@@ -456,14 +501,22 @@ async function acquireAudioStream() {
 function scheduleReconnect(reason) {
   if (isManualStop) return;
 
+  // 네트워크 자체가 끊긴 상태면 재시도 횟수를 낭비하지 않고 online 이벤트가
+  // 올 때까지 기다린다 (아래 'online' 리스너에서 즉시 재시도).
+  if (!navigator.onLine) {
+    awaitingNetwork = true;
+    setStatus('네트워크 연결이 끊겼습니다. 연결되면 자동으로 재시도합니다.', 'warn');
+    return;
+  }
+
   reconnectAttempts++;
   if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-    setStatus('연결이 끊어졌습니다(' + reason + '). 중지 후 다시 시작해주세요.');
+    setStatus('연결이 끊어졌습니다(' + reason + '). 중지 후 다시 시작해주세요.', 'error');
     return;
   }
 
   const delayMs = Math.min(1000 * (2 ** (reconnectAttempts - 1)), 16000);
-  setStatus(`연결이 끊어졌습니다. ${Math.round(delayMs / 1000)}초 후 재연결 시도... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+  setStatus(`연결이 끊어졌습니다. ${Math.round(delayMs / 1000)}초 후 재연결 시도... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`, 'warn');
 
   clearTimeout(reconnectTimer);
   reconnectTimer = setTimeout(() => {
@@ -471,12 +524,26 @@ function scheduleReconnect(reason) {
   }, delayMs);
 }
 
+window.addEventListener('offline', () => {
+  if (!isManualStop) setStatus('네트워크 연결이 끊겼습니다. 연결되면 자동으로 재시도합니다.', 'warn');
+});
+
+window.addEventListener('online', () => {
+  if (!isManualStop && awaitingNetwork) {
+    awaitingNetwork = false;
+    reconnectAttempts = 0;
+    clearTimeout(reconnectTimer);
+    startRecognition();
+  }
+});
+
 async function startRecognition() {
   if (recognizer) {
     try { recognizer.close(); } catch (e) {}
     recognizer = null;
   }
   stopMicStream();
+  awaitingNetwork = false;
 
   try {
     const speechConfig = SpeechSDK.SpeechTranslationConfig.fromSubscription(currentKey, FIXED_REGION);
@@ -515,19 +582,23 @@ async function startRecognition() {
         document.getElementById('setup').style.display = 'none';
         document.getElementById('caption').style.display = 'flex';
         document.getElementById('controls').style.display = 'flex';
-        setStatus('인식 중...');
+        setStatus('인식 중...', 'ok');
         startPipStream();
+        requestWakeLock();
       },
       (err) => {
-        setStatus('시작 실패: ' + err);
+        setStatus('시작 실패: ' + err, 'error');
       }
     );
   } catch (err) {
-    setStatus('오류 발생: ' + err.message);
+    setStatus('오류 발생: ' + err.message, 'error');
   }
 }
 
 document.getElementById('startBtn').addEventListener('click', async () => {
+  const startBtn = document.getElementById('startBtn');
+  if (startBtn.disabled) return; // 중복 클릭 방지
+
   const key = document.getElementById('key').value.trim();
   const langSelectValue = document.getElementById('srcLang').value;
   const srcLang = langSelectValue === 'custom'
@@ -570,8 +641,34 @@ document.getElementById('startBtn').addEventListener('click', async () => {
   finalText = '';
   prevDisplayText = '';
 
+  startBtn.disabled = true;
+  startBtn.textContent = '시작 중...';
   setStatus(audioSource === 'display' ? '공유할 화면/탭을 선택해주세요...' : '마이크 권한을 요청하는 중...');
+
   await startRecognition();
+
+  // 성공 시에는 setup 화면이 숨겨지므로 그대로 두고, 실패했을 때만 버튼을 복구한다
+  if (document.getElementById('setup').style.display !== 'none') {
+    startBtn.disabled = false;
+    startBtn.textContent = '시작';
+  }
+});
+
+document.getElementById('clearKeyBtn').addEventListener('click', () => {
+  localStorage.removeItem('captionSettings');
+  document.getElementById('key').value = '';
+  document.getElementById('rememberMe').checked = false;
+  setStatus('저장된 키를 삭제했습니다.');
+});
+
+// PIP 진입/종료 상태에 맞춰 버튼 라벨을 바꿔준다 (표준 API + Safari webkit API 둘 다)
+function setPipBtnLabel(inPip) {
+  document.getElementById('pipBtn').textContent = inPip ? 'PIP 종료' : 'PIP로 띄우기';
+}
+pipVideoEl.addEventListener('enterpictureinpicture', () => setPipBtnLabel(true));
+pipVideoEl.addEventListener('leavepictureinpicture', () => setPipBtnLabel(false));
+pipVideoEl.addEventListener('webkitpresentationmodechanged', () => {
+  setPipBtnLabel(pipVideoEl.webkitPresentationMode === 'picture-in-picture');
 });
 
 // iOS Safari는 표준 Picture-in-Picture API 대신 webkit 전용 API를 쓰는 경우가 있어 둘 다 지원
@@ -613,8 +710,10 @@ document.getElementById('pipBtn').addEventListener('click', async () => {
 
 document.getElementById('stopBtn').addEventListener('click', () => {
   isManualStop = true;
+  awaitingNetwork = false;
   clearTimeout(reconnectTimer);
   reconnectTimer = null;
+  releaseWakeLock();
 
   const finishStop = () => {
     document.getElementById('setup').style.display = 'flex';
@@ -628,6 +727,11 @@ document.getElementById('stopBtn').addEventListener('click', () => {
     lastCaptionText = '';
     lastPrevText = '';
     stopMicStream();
+
+    const startBtn = document.getElementById('startBtn');
+    startBtn.disabled = false;
+    startBtn.textContent = '시작';
+    setPipBtnLabel(false);
 
     if (document.pictureInPictureElement) {
       document.exitPictureInPicture().catch(() => {});
@@ -662,6 +766,15 @@ document.getElementById('stopBtn').addEventListener('click', () => {
     finishStop();
   }
 });
+
+// 인식 중에 탭을 닫거나 새로고침하면 진행 중인 자막/연결이 끊기므로 한 번 확인한다
+window.addEventListener('beforeunload', (e) => {
+  if (!isManualStop && recognizer) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+
 </script>
 
 </body>

@@ -1,9 +1,12 @@
 {
   "name": "실시간 한글 자막",
   "short_name": "실시간자막",
+  "description": "영상 음성을 실시간으로 인식해 한글 자막으로 번역해주는 개인용 도구",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
+  "orientation": "any",
+  "lang": "ko",
   "background_color": "#0b0b0f",
   "theme_color": "#0b0b0f",
   "icons": [
