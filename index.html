@@ -427,6 +427,16 @@ document.getElementById('srcLang').addEventListener('change', (e) => {
   document.getElementById('customLang').style.display = (e.target.value === 'custom') ? 'block' : 'none';
 });
 
+// 키/언어 입력창에서 Enter로 바로 시작할 수 있게
+['key', 'customLang'].forEach((id) => {
+  document.getElementById(id).addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      document.getElementById('startBtn').click();
+    }
+  });
+});
+
 // 언어 코드 형식 검증 (예: en-US, nl-NL)
 function isValidLangCode(code) {
   return /^[a-zA-Z]{2,3}-[a-zA-Z]{2,4}$/.test(code);
@@ -472,12 +482,31 @@ function stopMicStream() {
 // - 'display': 화면/탭 공유로 오디오를 디지털로 직접 캡처(크롬 전용). 마이크를
 //   거치지 않아 훨씬 깨끗한 소스를 넘길 수 있다. 공유 대상으로 "크롬 탭"을 고르고
 //   "탭 오디오 공유"를 체크해야 오디오 트랙이 들어온다.
+// getUserMedia/getDisplayMedia가 던지는 DOMException은 이름이 기술적이라
+// 그대로 보여주면 사용자가 원인을 알기 어려움 - 흔한 경우만 친절한 문구로 바꿔준다.
+function describeMediaError(err, context) {
+  if (err.name === 'NotAllowedError') {
+    return context === 'display'
+      ? '화면/탭 공유가 취소되었거나 거부되었습니다.'
+      : '마이크 권한이 거부되었습니다. 브라우저 설정에서 마이크 권한을 허용해주세요.';
+  }
+  if (err.name === 'NotFoundError') {
+    return '사용 가능한 마이크를 찾을 수 없습니다.';
+  }
+  return err.message;
+}
+
 async function acquireAudioStream() {
   if (currentAudioSource === 'display') {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
       throw new Error('이 브라우저는 화면/탭 오디오 공유를 지원하지 않습니다. 크롬을 사용해주세요.');
     }
-    const displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+    let displayStream;
+    try {
+      displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+    } catch (err) {
+      throw new Error(describeMediaError(err, 'display'));
+    }
     const audioTracks = displayStream.getAudioTracks();
     if (audioTracks.length === 0) {
       displayStream.getTracks().forEach(t => t.stop());
@@ -488,14 +517,18 @@ async function acquireAudioStream() {
     return displayStream;
   }
 
-  // 에코 제거/노이즈 억제를 꺼서 스피커로 재생 중인 영상 소리도 그대로 인식하도록 함
-  return navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: false,
-      noiseSuppression: false,
-      autoGainControl: false
-    }
-  });
+  try {
+    // 에코 제거/노이즈 억제를 꺼서 스피커로 재생 중인 영상 소리도 그대로 인식하도록 함
+    return await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      }
+    });
+  } catch (err) {
+    throw new Error(describeMediaError(err, 'mic'));
+  }
 }
 
 function scheduleReconnect(reason) {
@@ -551,6 +584,14 @@ async function startRecognition() {
     speechConfig.addTargetLanguage('ko');
 
     rawStream = await acquireAudioStream();
+
+    // 오디오를 받는 동안(특히 화면 공유 선택 창 대기 중) 사용자가 중지를 눌렀다면
+    // 여기서 바로 정리하고 끝낸다 - 그대로 진행하면 중지 이후에 세션이 되살아난다.
+    if (isManualStop) {
+      stopMicStream();
+      return;
+    }
+
     const audioConfig = SpeechSDK.AudioConfig.fromStreamInput(rawStream);
     recognizer = new SpeechSDK.TranslationRecognizer(speechConfig, audioConfig);
 
@@ -580,6 +621,17 @@ async function startRecognition() {
 
     recognizer.startContinuousRecognitionAsync(
       () => {
+        // 이 콜백이 호출될 즈음 사용자가 이미 중지를 눌렀다면(비동기 간극 사이에
+        // 발생 가능), 세션을 바로 정리하고 UI는 건드리지 않는다 - 안 그러면 중지한
+        // 뒤에 화면이 다시 "인식 중..."으로 되살아나는 문제가 생긴다.
+        if (isManualStop) {
+          recognizer && recognizer.stopContinuousRecognitionAsync(() => {
+            if (recognizer) { recognizer.close(); recognizer = null; }
+          }, () => { recognizer = null; });
+          stopMicStream();
+          return;
+        }
+
         // 주의: 이 콜백은 로컬에서 인식 루프가 시작됐다는 뜻일 뿐, 서버 인증/연결이
         // 성공했다는 보장은 아니다(키가 잘못돼도 일단 호출됨). 그래서 재시도 횟수는
         // 여기서 초기화하지 않고, 실제 recognizing/recognized 이벤트가 들어왔을 때만
